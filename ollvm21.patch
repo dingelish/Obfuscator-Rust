@@ -958,10 +958,10 @@ index 0000000000000000000000000000000000000000..e20b431bcb69267acc39eaf8fdb94c30
 +<https://www.gnu.org/licenses/>.
 diff --git a/llvm/include/llvm/Transforms/Obfuscation/Obfuscation.h b/llvm/include/llvm/Transforms/Obfuscation/Obfuscation.h
 new file mode 100755
-index 0000000000000000000000000000000000000000..3723704a1624f900b6572822c73fb93cc9d609d2
+index 0000000000000000000000000000000000000000..b70cf4752434115cc934f7fdf995d2ddb6ea546e
 --- /dev/null
 +++ b/llvm/include/llvm/Transforms/Obfuscation/Obfuscation.h
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,38 @@
 +#ifndef _OBFUSCATION_H_
 +#define _OBFUSCATION_H_
 +
@@ -971,11 +971,14 @@ index 0000000000000000000000000000000000000000..3723704a1624f900b6572822c73fb93c
 +#include "llvm/Transforms/Obfuscation/AntiHook.h"
 +#include "llvm/Transforms/Obfuscation/BogusControlFlow.h"
 +#include "llvm/Transforms/Obfuscation/ConstantEncryption.h"
++#include "llvm/Transforms/Obfuscation/ConstantFPEncryption.h"
 +#include "llvm/Transforms/Obfuscation/CryptoUtils.h"
 +#include "llvm/Transforms/Obfuscation/Flattening.h"
 +#include "llvm/Transforms/Obfuscation/FunctionCallObfuscate.h"
 +#include "llvm/Transforms/Obfuscation/FunctionWrapper.h"
 +#include "llvm/Transforms/Obfuscation/IndirectBranch.h"
++#include "llvm/Transforms/Obfuscation/IndirectCall.h"
++#include "llvm/Transforms/Obfuscation/IndirectGlobalVariable.h"
 +#include "llvm/Transforms/Obfuscation/Split.h"
 +#include "llvm/Transforms/Obfuscation/StringEncryption.h"
 +#include "llvm/Transforms/Obfuscation/Substitution.h"
@@ -2760,10 +2763,10 @@ index 0000000000000000000000000000000000000000..5d2a2a25b026e36bafca1b10742e63c0
 +INITIALIZE_PASS(AntiClassDump, "acd", "Enable Anti-ClassDump.", false, false)
 diff --git a/llvm/lib/Transforms/Obfuscation/AntiDebugging.cpp b/llvm/lib/Transforms/Obfuscation/AntiDebugging.cpp
 new file mode 100755
-index 0000000000000000000000000000000000000000..01085fec9f8ec50fe8b04916b7f00526bdb5166f
+index 0000000000000000000000000000000000000000..5426ae24a20dab23bb5092b955ae3956eb38392f
 --- /dev/null
 +++ b/llvm/lib/Transforms/Obfuscation/AntiDebugging.cpp
-@@ -0,0 +1,319 @@
+@@ -0,0 +1,390 @@
 +/*
 + *  LLVM AntiDebugging Pass
 +    Copyright (C) 2017 Zhang(https://github.com/Naville/)
@@ -2784,9 +2787,12 @@ index 0000000000000000000000000000000000000000..01085fec9f8ec50fe8b04916b7f00526
 +#include "llvm/Transforms/Obfuscation/AntiDebugging.h"
 +#include "llvm/ADT/SmallString.h"
 +#include "llvm/IR/Constants.h"
++#include "llvm/IR/DerivedTypes.h"
++#include "llvm/IR/GlobalVariable.h"
 +#include "llvm/IR/IRBuilder.h"
 +#include "llvm/IR/InlineAsm.h"
 +#include "llvm/IR/Instructions.h"
++#include "llvm/IR/Module.h"
 +#include "llvm/IRReader/IRReader.h"
 +#include "llvm/Linker/Linker.h"
 +#include "llvm/Support/CommandLine.h"
@@ -2796,6 +2802,7 @@ index 0000000000000000000000000000000000000000..01085fec9f8ec50fe8b04916b7f00526
 +#include "llvm/TargetParser/Triple.h"
 +#include "llvm/Transforms/Obfuscation/CryptoUtils.h"
 +#include "llvm/Transforms/Obfuscation/Utils.h"
++#include "llvm/Transforms/Utils/ModuleUtils.h"
 +#include <fstream>
 +
 +using namespace llvm;
@@ -2882,17 +2889,133 @@ index 0000000000000000000000000000000000000000..01085fec9f8ec50fe8b04916b7f00526
 +                "-adb_prob=x must be 0 < x <= 100";
 +      return false;
 +    }
++    this->triple = Triple(M.getTargetTriple());
++
++    // Decide whether AntiDebugging applies to this module at all.
++    bool anyEnabled = false;
++    for (Function &F : M) {
++      if (toObfuscate(flag, &F, "adb") && F.getName() != "ADBCallBack" &&
++          F.getName() != "InitADB") {
++        anyEnabled = true;
++        break;
++      }
++    }
++    if (!anyEnabled)
++      return false;
++
++    if (!this->initialized)
++      initialize(M);
++
++    // If precompiled AntiDebugging IR was linked in, keep the original
++    // per-function behaviour (inject a call to InitADB at each function entry).
++    bool havePrecompiled =
++        M.getFunction("ADBCallBack") && M.getFunction("InitADB");
++
++    // For the inline-asm fallback on x86-64 (Linux/Windows) we do NOT inject the
++    // check at every function terminator. That approach is unreliable:
++    //   (1) PTRACE_TRACEME is stateful, so a second invocation returns -1 and
++    //       the check would exit(1) even with no debugger present; and
++    //   (2) when composed with control-flow-mutating passes (allobf/antihook)
++    //       the terminator-anchored asm is reordered or eliminated, leaving it
++    //       inert.
++    // Instead we emit a single global constructor that runs the check exactly
++    // once, before main(). This gives deterministic anti-debug + anti-attach
++    // (PTRACE_TRACEME makes the process traced by its parent, so a later
++    // PTRACE_ATTACH by a debugger fails). adb_prob is intentionally ignored for
++    // this path: anti-debugging must be deterministic to be useful.
++    if (!havePrecompiled && triple.isX86() && triple.isArch64Bit() &&
++        (triple.isOSLinux() || triple.isOSWindows())) {
++      emitX86StartupCheck(M);
++      return true;
++    }
++
 +    for (Function &F : M) {
 +      if (toObfuscate(flag, &F, "adb") && F.getName() != "ADBCallBack" &&
 +          F.getName() != "InitADB") {
 +        errs() << "Running AntiDebugging On " << F.getName() << "\n";
-+        if (!this->initialized)
-+          initialize(M);
 +        if (cryptoutils->get_range(100) <= ProbRate)
 +          runOnFunction(F);
 +      }
 +    }
 +    return true;
++  }
++  // Emit a single startup constructor performing the x86-64 anti-debug check.
++  void emitX86StartupCheck(Module &M) {
++    LLVMContext &Ctx = M.getContext();
++    if (M.getFunction("__hikari_adb_ctor"))
++      return; // Only ever one per module.
++    std::string antidebugasm;
++    if (triple.isOSLinux()) {
++      // Linux ptrace(PTRACE_TRACEME) check. Literal '$' immediates must be
++      // escaped as '$$' in LLVM inline asm, otherwise '$101' etc. are parsed as
++      // operand references ("Invalid $ operand number in inline asm string").
++      antidebugasm = "movq $$101, %rax\n" // PTRACE_TRACEME
++                     "xorq %rdi, %rdi\n"
++                     "xorq %rsi, %rsi\n"
++                     "xorq %rdx, %rdx\n"
++                     "xorq %r10, %r10\n"
++                     "syscall\n" // Returns 0 on success, -1 if already traced.
++                     "cmpq $$0, %rax\n"
++                     "jl 1f\n"
++                     "jmp 2f\n"
++                     "1:\n"
++                     "movq $$60, %rax\n" // sys_exit
++                     "movq $$1, %rdi\n"
++                     "syscall\n"
++                     "2:\n";
++    } else { // Windows
++      antidebugasm = "movq %gs:0x60, %rax\n"
++                     "movzbl 0x2(%rax), %eax\n"
++                     "testl %eax, %eax\n"
++                     "jne 1f\n"
++                     "jmp 2f\n"
++                     "1:\n"
++                     "ud2\n"
++                     "2:\n";
++    }
++    FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), false);
++    Type *Int8Ty = Type::getInt8Ty(Ctx);
++
++    // A single shared run-once flag. The obfuscation pass runs per-module, and a
++    // real Rust binary is many crates (== many LLVM modules), so each emits its
++    // own constructor. PTRACE_TRACEME is stateful: the first constructor marks
++    // the process as traced by its parent, so a *second* TRACEME returns -1 and
++    // would exit(1) even with no debugger present. Coordinate all constructors
++    // through one flag: give it LinkOnceODR linkage + a stable external name so
++    // the linker (and LTO) coalesce every copy into a single symbol, and access
++    // it volatile so the optimizer can neither fold the load to its initializer
++    // nor delete the store.
++    GlobalVariable *Flag = M.getGlobalVariable("__hikari_adb_done");
++    if (!Flag)
++      Flag = new GlobalVariable(
++          M, Int8Ty, /*isConstant=*/false,
++          GlobalValue::LinkageTypes::LinkOnceODRLinkage,
++          ConstantInt::get(Int8Ty, 0), "__hikari_adb_done");
++
++    Function *Ctor = Function::Create(
++        FT, GlobalValue::LinkageTypes::PrivateLinkage, "__hikari_adb_ctor", &M);
++    BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Ctor);
++    BasicBlock *Check = BasicBlock::Create(Ctx, "check", Ctor);
++    BasicBlock *Ret = BasicBlock::Create(Ctx, "ret", Ctor);
++    IRBuilder<> Builder(Entry);
++    // if (__hikari_adb_done != 0) return; else { __hikari_adb_done = 1; check(); }
++    Value *Cur = Builder.CreateLoad(Int8Ty, Flag, /*isVolatile=*/true);
++    Value *Already =
++        Builder.CreateICmpNE(Cur, ConstantInt::get(Int8Ty, 0));
++    Builder.CreateCondBr(Already, Ret, Check);
++    Builder.SetInsertPoint(Check);
++    Builder.CreateStore(ConstantInt::get(Int8Ty, 1), Flag, /*isVolatile=*/true);
++    InlineAsm *IA = InlineAsm::get(
++        FT, antidebugasm,
++        // syscall clobbers rcx and r11; clobber memory so nothing is reordered
++        // across the check.
++        "~{rax},~{rdi},~{rsi},~{rdx},~{r10},~{rcx},~{r11},~{cc},~{memory}",
++        /*hasSideEffects=*/true, /*isAlignStack=*/false);
++    Builder.CreateCall(IA, {});
++    Builder.CreateBr(Ret);
++    Builder.SetInsertPoint(Ret);
++    Builder.CreateRetVoid();
++    appendToGlobalCtors(M, Ctor, /*Priority=*/0);
 +  }
 +  bool runOnFunction(Function &F) {
 +    BasicBlock *EntryBlock = &(F.getEntryBlock());
@@ -3018,55 +3141,6 @@ index 0000000000000000000000000000000000000000..01085fec9f8ec50fe8b04916b7f00526
 +#else
 +        CallInst::Create(IA, None, "", I);
 +#endif
-+      } else if (triple.isX86() && triple.isArch64Bit()) {
-+        errs() << "Injecting Inline Assembly AntiDebugging For x64:"
-+               << F.getParent()->getTargetTriple().str() << "\n";
-+        std::string antidebugasm = "";
-+        if (triple.isOSLinux()) {
-+          // Linux ptrace check
-+          antidebugasm = "movq $101, %rax\n"
-+                         "xorq %rdi, %rdi\n"
-+                         "xorq %rsi, %rsi\n"
-+                         "xorq %rdx, %rdx\n"
-+                         "xorq %r10, %r10\n"
-+                         "syscall\n" // Returns 0 on success, -1 on failure
-+                                     // (already traced)
-+                         "cmpq $0, %rax\n"
-+                         "jl 1f\n"
-+                         "jmp 2f\n"
-+                         "1:\n"
-+                         "movq $60, %rax\n" // sys_exit
-+                         "movq $1, %rdi\n"
-+                         "syscall\n"
-+                         "2:\n";
-+        } else if (triple.isOSWindows()) {
-+          // Windows PEB check
-+          antidebugasm = "movq %gs:0x60, %rax\n"
-+                         "movzbl 0x2(%rax), %eax\n"
-+                         "testl %eax, %eax\n"
-+                         "jne 1f\n"
-+                         "jmp 2f\n"
-+                         "1:\n"
-+                         "ud2\n" // Undefined instruction constraint to crash
-+                         "2:\n";
-+        }
-+
-+        if (!antidebugasm.empty()) {
-+          InlineAsm *IA = InlineAsm::get(
-+              FunctionType::get(Type::getVoidTy(EntryBlock->getContext()),
-+                                false),
-+              antidebugasm,
-+              "~{rax},~{rdi},~{rsi},~{rdx},~{r10},~{cc}", // Clobber list
-+              true, false);
-+          Instruction *I = nullptr;
-+          for (BasicBlock &BB : F)
-+            I = BB.getTerminator();
-+#if LLVM_VERSION_MAJOR >= 16
-+          CallInst::Create(IA, std::nullopt, "", I);
-+#else
-+          CallInst::Create(IA, None, "", I);
-+#endif
-+        }
 +      } else {
 +        errs() << "Unsupported Inline Assembly AntiDebugging Target: "
 +               << F.getParent()->getTargetTriple().str() << "\n";
@@ -4285,10 +4359,10 @@ index 0000000000000000000000000000000000000000..50d68013c52c08149835f673b8634ba8
 +}
 diff --git a/llvm/lib/Transforms/Obfuscation/CMakeLists.txt b/llvm/lib/Transforms/Obfuscation/CMakeLists.txt
 new file mode 100755
-index 0000000000000000000000000000000000000000..f06dfd1dbc51961b6ac04f8e6e2a19a6fcf214d3
+index 0000000000000000000000000000000000000000..8043e500450f00d779c9a83779f4d948d9f7da11
 --- /dev/null
 +++ b/llvm/lib/Transforms/Obfuscation/CMakeLists.txt
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,38 @@
 +add_llvm_component_library(LLVMObfuscation
 +        FunctionCallObfuscate.cpp
 +        CryptoUtils.cpp
@@ -4303,8 +4377,11 @@ index 0000000000000000000000000000000000000000..f06dfd1dbc51961b6ac04f8e6e2a19a6
 +        AntiHooking.cpp
 +        StringEncryption.cpp
 +        IndirectBranch.cpp
++        IndirectCall.cpp
++        IndirectGlobalVariable.cpp
 +        FunctionWrapper.cpp
 +        ConstantEncryption.cpp
++        ConstantFPEncryption.cpp
 +        Obfuscation.cpp
 +        DEPENDS
 +        intrinsics_gen
@@ -6480,10 +6557,10 @@ index 0000000000000000000000000000000000000000..e20b431bcb69267acc39eaf8fdb94c30
 +<https://www.gnu.org/licenses/>.
 diff --git a/llvm/lib/Transforms/Obfuscation/Obfuscation.cpp b/llvm/lib/Transforms/Obfuscation/Obfuscation.cpp
 new file mode 100755
-index 0000000000000000000000000000000000000000..2c2e9a93bf8ba6a92b96908de0db105e0e04344d
+index 0000000000000000000000000000000000000000..422a869027a64f60437604737f5a7a57d5203c6c
 --- /dev/null
 +++ b/llvm/lib/Transforms/Obfuscation/Obfuscation.cpp
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,272 @@
 +// For open-source license, please refer to
 +// [License](https://github.com/HikariObfuscator/Hikari/wiki/License).
 +//===----------------------------------------------------------------------===//
@@ -6535,8 +6612,18 @@ index 0000000000000000000000000000000000000000..2c2e9a93bf8ba6a92b96908de0db105e
 +    EnableConstantEncryption("enable-constenc", cl::init(false), cl::NotHidden,
 +                             cl::desc("Enable Constant Encryption."));
 +static cl::opt<bool>
++    EnableConstantFPEncryption("enable-constfpenc", cl::init(false),
++                               cl::NotHidden,
++                               cl::desc("Enable Constant FP Encryption."));
++static cl::opt<bool>
 +    EnableIndirectBranching("enable-indibran", cl::init(false), cl::NotHidden,
 +                            cl::desc("Enable Indirect Branching."));
++static cl::opt<bool>
++    EnableIndirectCall("enable-icall", cl::init(false), cl::NotHidden,
++                       cl::desc("Enable Indirect Call."));
++static cl::opt<bool>
++    EnableIndirectGlobalVariable("enable-indgv", cl::init(false), cl::NotHidden,
++                                 cl::desc("Enable Indirect Global Variable."));
 +static cl::opt<bool>
 +    EnableFunctionWrapper("enable-funcwra", cl::init(false), cl::NotHidden,
 +                          cl::desc("Enable Function Wrapper."));
@@ -6561,6 +6648,12 @@ index 0000000000000000000000000000000000000000..2c2e9a93bf8ba6a92b96908de0db105e
 +  if (getenv("INDIBRAN")) {
 +    EnableIndirectBranching = true;
 +  }
++  if (getenv("ICALL")) {
++    EnableIndirectCall = true;
++  }
++  if (getenv("INDGV")) {
++    EnableIndirectGlobalVariable = true;
++  }
 +  if (getenv("FUNCWRA")) {
 +    EnableFunctionWrapper = true; // Broken
 +  }
@@ -6575,6 +6668,9 @@ index 0000000000000000000000000000000000000000..2c2e9a93bf8ba6a92b96908de0db105e
 +  }
 +  if (getenv("CONSTENC")) {
 +    EnableConstantEncryption = true;
++  }
++  if (getenv("CONSTFPENC")) {
++    EnableConstantFPEncryption = true;
 +  }
 +  if (getenv("ANTIHOOK")) {
 +    EnableAntiHooking = true;
@@ -6651,7 +6747,12 @@ index 0000000000000000000000000000000000000000..2c2e9a93bf8ba6a92b96908de0db105e
 +        P->runOnFunction(F);
 +        delete P;
 +      }
-+    MP = createConstantEncryptionPass(EnableConstantEncryption);
++    MP = createConstantEncryptionPass(EnableAllObfuscation ||
++                                      EnableConstantEncryption);
++    MP->runOnModule(M);
++    delete MP;
++    MP = createConstantFPEncryptionPass(EnableAllObfuscation ||
++                                        EnableConstantFPEncryption);
 +    MP->runOnModule(M);
 +    delete MP;
 +    errs() << "Doing Post-Run Cleanup\n";
@@ -6661,6 +6762,18 @@ index 0000000000000000000000000000000000000000..2c2e9a93bf8ba6a92b96908de0db105e
 +      if (!F.isDeclaration())
 +        P->runOnFunction(F);
 +    delete P;
++    FunctionPass *PGV = createIndirectGlobalVariablePass(
++        EnableAllObfuscation || EnableIndirectGlobalVariable);
++    for (Function &F : M)
++      if (!F.isDeclaration())
++        PGV->runOnFunction(F);
++    delete PGV;
++    FunctionPass *PIC =
++        createIndirectCallPass(EnableAllObfuscation || EnableIndirectCall);
++    for (Function &F : M)
++      if (!F.isDeclaration())
++        PIC->runOnFunction(F);
++    delete PIC;
 +    MP = createFunctionWrapperPass(EnableAllObfuscation ||
 +                                   EnableFunctionWrapper);
 +    MP->runOnModule(M);
@@ -6710,9 +6823,12 @@ index 0000000000000000000000000000000000000000..2c2e9a93bf8ba6a92b96908de0db105e
 +INITIALIZE_PASS_BEGIN(Obfuscation, "obfus", "Enable Obfuscation", false, false)
 +INITIALIZE_PASS_DEPENDENCY(AntiClassDump);
 +INITIALIZE_PASS_DEPENDENCY(BogusControlFlow);
++INITIALIZE_PASS_DEPENDENCY(ConstantFPEncryption);
 +INITIALIZE_PASS_DEPENDENCY(Flattening);
 +INITIALIZE_PASS_DEPENDENCY(FunctionCallObfuscate);
 +INITIALIZE_PASS_DEPENDENCY(IndirectBranch);
++INITIALIZE_PASS_DEPENDENCY(IndirectCall);
++INITIALIZE_PASS_DEPENDENCY(IndirectGlobalVariable);
 +INITIALIZE_PASS_DEPENDENCY(SplitBasicBlock);
 +INITIALIZE_PASS_DEPENDENCY(StringEncryption);
 +INITIALIZE_PASS_DEPENDENCY(Substitution);
@@ -33164,3 +33280,758 @@ index 0000000000000000000000000000000000000000..8404a9db3ffcfb7c0469e08eaf8d217f
 +
 +
 +#endif  // INCLUDE_NLOHMANN_JSON_HPP_
+diff --git a/llvm/include/llvm/Transforms/Obfuscation/IndirectGlobalVariable.h b/llvm/include/llvm/Transforms/Obfuscation/IndirectGlobalVariable.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..240e933d83da33989ec6d25bf79ed3f2b3bf9b5a
+--- /dev/null
++++ b/llvm/include/llvm/Transforms/Obfuscation/IndirectGlobalVariable.h
+@@ -0,0 +1,14 @@
++#ifndef _INDIRECT_GLOBAL_VARIABLE_H_
++#define _INDIRECT_GLOBAL_VARIABLE_H_
++
++#include "llvm/IR/PassManager.h"
++#include "llvm/Pass.h"
++
++namespace llvm {
++
++FunctionPass *createIndirectGlobalVariablePass(bool flag);
++void initializeIndirectGlobalVariablePass(PassRegistry &Registry);
++
++} // namespace llvm
++
++#endif
+diff --git a/llvm/lib/Transforms/Obfuscation/IndirectGlobalVariable.cpp b/llvm/lib/Transforms/Obfuscation/IndirectGlobalVariable.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..c21b893c2aedca38befd1fcf909db2b3b83f81b0
+--- /dev/null
++++ b/llvm/lib/Transforms/Obfuscation/IndirectGlobalVariable.cpp
+@@ -0,0 +1,277 @@
++// For open-source license, please refer to
++// [License](https://github.com/HikariObfuscator/Hikari/wiki/License).
++//===----------------------------------------------------------------------===//
++// IndirectGlobalVariable - replace direct references to global variables with
++// runtime loads from an (optionally encrypted) address table. Modeled after the
++// Hikari-style IndirectBranch pass shipped in this tree.
++//===----------------------------------------------------------------------===//
++#include "llvm/Transforms/Obfuscation/IndirectGlobalVariable.h"
++#include "llvm/ADT/STLExtras.h"
++#include "llvm/ADT/SmallVector.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/InstIterator.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/NoFolder.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Support/raw_ostream.h"
++#include "llvm/Transforms/Obfuscation/CryptoUtils.h"
++#include "llvm/Transforms/Obfuscation/Utils.h"
++#include "llvm/Transforms/Utils/ModuleUtils.h"
++
++#include <climits>
++#include <cstdint>
++#include <map>
++#include <utility>
++#include <vector>
++
++using namespace llvm;
++
++static cl::opt<bool> EncryptGVAddr(
++    "indgv-enc-addr", cl::init(false), cl::NotHidden,
++    cl::desc("[IndirectGlobalVariable]Encrypt global variable address"));
++
++static cl::opt<bool>
++    SkipRustLib("indgv-skip-rustlib", cl::init(true), cl::NotHidden,
++                cl::desc("[IndirectGlobalVariable]Skip Rust std/core/alloc and "
++                         "common async ecosystem functions"));
++
++static cl::opt<unsigned> MaxBasicBlocks(
++    "indgv-max-bbs", cl::init(0), cl::NotHidden,
++    cl::desc("[IndirectGlobalVariable]Skip functions with more than N basic "
++             "blocks (0 disables)"));
++
++static bool shouldSkipFunction(const Function &F) {
++  if (MaxBasicBlocks != 0 && F.size() > MaxBasicBlocks)
++    return true;
++  if (!SkipRustLib)
++    return false;
++  StringRef N = F.getName();
++  if (N.starts_with("_ZN4core") || N.starts_with("_ZN3std") ||
++      N.starts_with("_ZN5alloc") || N.starts_with("_ZN5tokio") ||
++      N.starts_with("_ZN5hyper") || N.starts_with("_ZN6rustls") ||
++      N.starts_with("_ZN7futures") || N.starts_with("_ZN5bytes") ||
++      N.starts_with("_ZN5tonic"))
++    return true;
++  if (N.contains("core..") || N.contains("std..") || N.contains("alloc..") ||
++      N.contains("tokio..") || N.contains("hyper..") || N.contains("rustls..") ||
++      N.contains("futures") || N.contains("bytes..") || N.contains("tonic.."))
++    return true;
++  return false;
++}
++
++static bool isEligibleGV(GlobalVariable *GV) {
++  if (!GV)
++    return false;
++  if (GV->isThreadLocal())
++    return false;
++  if (GV->isDeclaration())
++    return false;
++  StringRef N = GV->getName();
++  if (N.starts_with("llvm."))
++    return false;
++  if (GV->hasSection() && GV->getSection() == "llvm.metadata")
++    return false;
++  if (N.contains("IndirectGlobalVariableTable") ||
++      N.contains("IndirectGVAddressEncryptKey"))
++    return false;
++  // Do not indirect globals synthesized by the StringEncryption (strcry) pass.
++  // These hold runtime-managed encrypted/decrypted string state that strcry
++  // rewrites in place via an injected decryption routine. Routing them through
++  // our address table has no obfuscation value and interacts badly with strcry
++  // (the produced binary miscompiles/segfaults under the assertions-off Release
++  // backend when both passes run, e.g. under -enable-allobf).
++  if (N.starts_with("EncryptedString") || N.starts_with("DecryptSpace") ||
++      N.starts_with("StringEncryptionEncStatus"))
++    return false;
++  return true;
++}
++
++namespace llvm {
++struct IndirectGlobalVariable : public FunctionPass {
++  static char ID;
++  bool flag;
++  bool initialized;
++  bool encrypt;
++  GlobalVariable *GVTable;
++  ConstantInt *MEncKey;
++  std::map<GlobalVariable *, unsigned> gvNumbering;
++
++  IndirectGlobalVariable() : FunctionPass(ID) {
++    this->flag = true;
++    this->initialized = false;
++    this->encrypt = false;
++    this->GVTable = nullptr;
++    this->MEncKey = nullptr;
++  }
++  IndirectGlobalVariable(bool flag) : FunctionPass(ID) {
++    this->flag = flag;
++    this->initialized = false;
++    this->encrypt = false;
++    this->GVTable = nullptr;
++    this->MEncKey = nullptr;
++  }
++  StringRef getPassName() const override { return "IndirectGlobalVariable"; }
++
++  bool initialize(Module &M) {
++    this->initialized = true;
++    Type *Int8Ty = Type::getInt8Ty(M.getContext());
++    Type *Int32Ty = Type::getInt32Ty(M.getContext());
++    Type *PtrTy = PointerType::getUnqual(M.getContext());
++
++    // Collect eligible globals referenced (directly) by obfuscated functions.
++    for (Function &F : M) {
++      if (!toObfuscate(flag, &F, "indgv"))
++        continue;
++      if (shouldSkipFunction(F))
++        continue;
++      for (Instruction &I : instructions(F))
++        for (Value *Op : I.operands())
++          if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Op))
++            if (isEligibleGV(GV) && !gvNumbering.count(GV)) {
++              unsigned idx = gvNumbering.size();
++              gvNumbering[GV] = idx;
++            }
++    }
++    if (gvNumbering.empty())
++      return false;
++
++    // Always encrypt the stored addresses. The plain (unencrypted) table is
++    // pointless -- the optimizer folds `load table[i]` of a constant pointer
++    // table straight back into direct global references, giving zero
++    // obfuscation -- and, worse, that fold lets the backend reason through the
++    // indirection into StringEncryption's writable decrypt buffers and
++    // miscompile the program (garbage strings / SIGSEGV under -enable-allobf on
++    // the assertions-off Release build). The runtime XOR/GEP decrypt keeps the
++    // table opaque, which both obfuscates and side-steps that miscompile. The
++    // -indgv-enc-addr flag is retained for compatibility but is now a no-op.
++    (void)EncryptGVAddr;
++    this->encrypt = true;
++    MEncKey = cast<ConstantInt>(ConstantInt::get(
++        Int32Ty, cryptoutils->get_range(UINT8_MAX, UINT16_MAX * 2) * 4));
++
++    std::vector<Constant *> Elements(gvNumbering.size());
++    for (auto &Entry : gvNumbering) {
++      Constant *Addr = Entry.first;
++      if (this->encrypt)
++        Addr = ConstantExpr::getGetElementPtr(Int8Ty, Entry.first, MEncKey);
++      Elements[Entry.second] = Addr;
++    }
++    ArrayType *AT = ArrayType::get(PtrTy, Elements.size());
++    Constant *CA = ConstantArray::get(AT, ArrayRef<Constant *>(Elements));
++    GVTable = new GlobalVariable(M, AT, false,
++                                 GlobalValue::LinkageTypes::PrivateLinkage, CA,
++                                 "IndirectGlobalVariableTable");
++    appendToCompilerUsed(M, {GVTable});
++    return true;
++  }
++
++  Value *buildIndirectAddr(Module &M, Instruction *InsertBefore,
++                           GlobalVariable *GV, GlobalVariable *KeyGV,
++                           ConstantInt *EncEncKey) {
++    Type *Int8Ty = Type::getInt8Ty(M.getContext());
++    Type *Int32Ty = Type::getInt32Ty(M.getContext());
++    Type *PtrTy = PointerType::getUnqual(M.getContext());
++    Value *zero = ConstantInt::get(Int32Ty, 0);
++
++    IRBuilder<NoFolder> IRB(InsertBefore);
++    Value *GEP = IRB.CreateGEP(
++        GVTable->getValueType(), GVTable,
++        {zero, ConstantInt::get(Int32Ty, gvNumbering[GV])});
++    Value *Ptr = IRB.CreateLoad(PtrTy, GEP, "indgv.addr");
++    if (this->encrypt) {
++      Value *KeyRuntime = IRB.CreateXor(
++          IRB.CreateLoad(Int32Ty, KeyGV), EncEncKey);
++      Ptr = IRB.CreateGEP(Int8Ty, Ptr, IRB.CreateSub(zero, KeyRuntime),
++                          "indgv.dec");
++    }
++    return Ptr;
++  }
++
++  bool runOnFunction(Function &Func) override {
++    if (!toObfuscate(flag, &Func, "indgv"))
++      return false;
++    if (shouldSkipFunction(Func))
++      return false;
++    Module *M = Func.getParent();
++    if (!this->initialized)
++      initialize(*M);
++    if (!GVTable || gvNumbering.empty())
++      return false;
++
++    Type *Int32Ty = Type::getInt32Ty(M->getContext());
++
++    // Collect the rewrite worklist first, so the per-function encryption key is
++    // only created when there is actual work. Creating a key global, appending
++    // it to llvm.compiler.used, and then erasing it (for a function with no
++    // eligible references) would leave a dangling use and crash downstream.
++    std::vector<std::pair<Instruction *, GlobalVariable *>> Work;
++    for (Instruction &I : instructions(Func)) {
++      if (isa<PHINode>(&I))
++        continue;
++      if (CallBase *CB = dyn_cast<CallBase>(&I))
++        if (Function *Callee = CB->getCalledFunction())
++          if (Callee->isIntrinsic())
++            continue;
++      SmallVector<GlobalVariable *, 4> Ops;
++      for (Value *Op : I.operands())
++        if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Op))
++          if (gvNumbering.count(GV) && !is_contained(Ops, GV))
++            Ops.push_back(GV);
++      for (GlobalVariable *GV : Ops)
++        Work.emplace_back(&I, GV);
++    }
++
++    struct PHIEdit {
++      PHINode *PN;
++      unsigned Idx;
++      GlobalVariable *GV;
++    };
++    std::vector<PHIEdit> PHIWork;
++    for (BasicBlock &BB : Func)
++      for (PHINode &PN : BB.phis())
++        for (unsigned i = 0, e = PN.getNumIncomingValues(); i < e; ++i)
++          if (GlobalVariable *GV =
++                  dyn_cast<GlobalVariable>(PN.getIncomingValue(i)))
++            if (gvNumbering.count(GV))
++              PHIWork.push_back({&PN, i, GV});
++
++    if (Work.empty() && PHIWork.empty())
++      return false;
++
++    // Now that we know there is work to do, create the per-function key global
++    // (if encryption is enabled). It is never erased after this point.
++    GlobalVariable *KeyGV = nullptr;
++    ConstantInt *EncEncKey = nullptr;
++    if (this->encrypt) {
++      EncEncKey = cast<ConstantInt>(
++          ConstantInt::get(Int32Ty, cryptoutils->get_uint32_t()));
++      uint64_t stored = EncEncKey->getZExtValue() ^ MEncKey->getZExtValue();
++      KeyGV = new GlobalVariable(
++          *M, Int32Ty, false, GlobalValue::LinkageTypes::PrivateLinkage,
++          ConstantInt::get(Int32Ty, stored), "IndirectGVAddressEncryptKey");
++      appendToCompilerUsed(*M, {KeyGV});
++    }
++
++    for (auto &WI : Work) {
++      Value *Addr =
++          buildIndirectAddr(*M, WI.first, WI.second, KeyGV, EncEncKey);
++      WI.first->replaceUsesOfWith(WI.second, Addr);
++    }
++    for (auto &PE : PHIWork) {
++      Instruction *IP = PE.PN->getIncomingBlock(PE.Idx)->getTerminator();
++      Value *Addr = buildIndirectAddr(*M, IP, PE.GV, KeyGV, EncEncKey);
++      PE.PN->setIncomingValue(PE.Idx, Addr);
++    }
++    return true;
++  }
++};
++} // namespace llvm
++
++FunctionPass *llvm::createIndirectGlobalVariablePass(bool flag) {
++  return new IndirectGlobalVariable(flag);
++}
++char IndirectGlobalVariable::ID = 0;
++INITIALIZE_PASS(IndirectGlobalVariable, "indgv", "IndirectGlobalVariable", false,
++                false)
+diff --git a/llvm/include/llvm/Transforms/Obfuscation/ConstantFPEncryption.h b/llvm/include/llvm/Transforms/Obfuscation/ConstantFPEncryption.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..06030bf40eb3779fd9784af5c455b5fe69b0ad46
+--- /dev/null
++++ b/llvm/include/llvm/Transforms/Obfuscation/ConstantFPEncryption.h
+@@ -0,0 +1,14 @@
++#ifndef _CONSTANT_FP_ENCRYPTION_H_
++#define _CONSTANT_FP_ENCRYPTION_H_
++
++#include "llvm/IR/PassManager.h"
++#include "llvm/Pass.h"
++
++namespace llvm {
++
++ModulePass *createConstantFPEncryptionPass(bool flag);
++void initializeConstantFPEncryptionPass(PassRegistry &Registry);
++
++} // namespace llvm
++
++#endif
+diff --git a/llvm/lib/Transforms/Obfuscation/ConstantFPEncryption.cpp b/llvm/lib/Transforms/Obfuscation/ConstantFPEncryption.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b806571191fbbc45d021d5d181207af6f63c5d28
+--- /dev/null
++++ b/llvm/lib/Transforms/Obfuscation/ConstantFPEncryption.cpp
+@@ -0,0 +1,155 @@
++/*
++    LLVM ConstantFPEncryption Pass
++    Floating-point counterpart of the integer ConstantEncryption pass.
++
++    This program is free software: you can redistribute it and/or modify
++    it under the terms of the GNU Affero General Public License as published
++    by the Free Software Foundation, either version 3 of the License, or
++    any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU Affero General Public License for more details.
++
++    You should have received a copy of the GNU Affero General Public License
++    along with this program.  If not, see <http://www.gnu.org/licenses/>.
++*/
++#include "llvm/Transforms/Obfuscation/ConstantFPEncryption.h"
++#include "llvm/ADT/APFloat.h"
++#include "llvm/ADT/APInt.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/InstIterator.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/IntrinsicInst.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/NoFolder.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Support/raw_ostream.h"
++#include "llvm/Transforms/Obfuscation/CryptoUtils.h"
++#include "llvm/Transforms/Obfuscation/SubstituteImpl.h"
++#include "llvm/Transforms/Obfuscation/Utils.h"
++
++#include <cstdint>
++
++using namespace llvm;
++
++static cl::opt<bool> SubstituteXor(
++    "constfpenc_subxor",
++    cl::desc("Substitute xor operator of ConstantFPEncryption"),
++    cl::value_desc("Substitute xor operator"), cl::init(false), cl::Optional);
++static bool SubstituteXorTemp = false;
++
++static cl::opt<uint32_t> ObfProbRate(
++    "constfpenc_prob",
++    cl::desc("Choose the probability [%] each instruction will be obfuscated "
++             "by the ConstantFPEncryption pass"),
++    cl::value_desc("probability rate"), cl::init(50), cl::Optional);
++static uint32_t ObfProbRateTemp = 50;
++
++static cl::opt<uint32_t> ObfTimes(
++    "constfpenc_times",
++    cl::desc(
++        "Choose how many times the ConstantFPEncryption pass loops on a func"),
++    cl::value_desc("Number of Times"), cl::init(1), cl::Optional);
++static uint32_t ObfTimesTemp = 1;
++
++namespace llvm {
++struct ConstantFPEncryption : public ModulePass {
++  static char ID;
++  bool flag;
++  ConstantFPEncryption(bool flag) : ModulePass(ID) { this->flag = flag; }
++  ConstantFPEncryption() : ModulePass(ID) { this->flag = true; }
++
++  bool shouldEncryptConstant(Instruction *I) {
++    if (isa<SwitchInst>(I) || isa<IntrinsicInst>(I) ||
++        isa<GetElementPtrInst>(I) || isa<PHINode>(I) || I->isAtomic())
++      return false;
++    if (!(cryptoutils->get_range(100) <= ObfProbRateTemp))
++      return false;
++    return true;
++  }
++
++  // Replace a scalar ConstantFP operand with bitcast(xor(enc, key)) so the
++  // literal bit pattern never appears directly in the emitted code.
++  bool HandleConstantFPOperand(Instruction *I, unsigned opindex) {
++    ConstantFP *CFP = dyn_cast<ConstantFP>(I->getOperand(opindex));
++    if (!CFP)
++      return false;
++    Type *FPTy = CFP->getType();
++    if (!FPTy->isFloatingPointTy())
++      return false;
++
++    APInt Bits = CFP->getValueAPF().bitcastToAPInt();
++    unsigned Width = Bits.getBitWidth();
++    // Only handle the widths a portable key generator can cover cleanly.
++    if (Width != 16 && Width != 32 && Width != 64)
++      return false;
++
++    uint64_t K;
++    if (Width == 16)
++      K = cryptoutils->get_uint16_t();
++    else if (Width == 32)
++      K = cryptoutils->get_uint32_t();
++    else
++      K = cryptoutils->get_uint64_t();
++
++    IntegerType *IntTy = IntegerType::get(I->getContext(), Width);
++    APInt Key(Width, K);
++    APInt Enc = Bits ^ Key;
++
++    ConstantInt *EncC = cast<ConstantInt>(ConstantInt::get(IntTy, Enc));
++    ConstantInt *KeyC = cast<ConstantInt>(ConstantInt::get(IntTy, Key));
++    BinaryOperator *XORInst =
++        BinaryOperator::Create(Instruction::Xor, EncC, KeyC, "", I);
++    Value *BC = new BitCastInst(XORInst, FPTy, "", I);
++    I->setOperand(opindex, BC);
++    if (SubstituteXorTemp)
++      SubstituteImpl::substituteXor(XORInst);
++    return true;
++  }
++
++  bool runOnModule(Module &M) override {
++    for (Function &F : M)
++      if (toObfuscate(flag, &F, "constfpenc") && !F.isPresplitCoroutine()) {
++        errs() << "Running ConstantFPEncryption On " << F.getName() << "\n";
++        FixFunctionConstantExpr(&F);
++        if (!toObfuscateUint32Option(&F, "constfpenc_prob", &ObfProbRateTemp))
++          ObfProbRateTemp = ObfProbRate;
++        if (ObfProbRateTemp > 100) {
++          errs() << "ConstantFPEncryption application instruction percentage "
++                    "-constfpenc_prob=x must be 0 < x <= 100";
++          return false;
++        }
++        if (!toObfuscateUint32Option(&F, "constfpenc_times", &ObfTimesTemp))
++          ObfTimesTemp = ObfTimes;
++        if (!toObfuscateBoolOption(&F, "constfpenc_subxor", &SubstituteXorTemp))
++          SubstituteXorTemp = SubstituteXor;
++        uint32_t times = ObfTimesTemp;
++        while (times) {
++          for (Instruction &I : instructions(F)) {
++            if (!shouldEncryptConstant(&I))
++              continue;
++            CallInst *CI = dyn_cast<CallInst>(&I);
++            for (unsigned i = 0; i < I.getNumOperands(); i++) {
++              if (CI && CI->isBundleOperand(i))
++                continue;
++              if (isa<ConstantFP>(I.getOperand(i)))
++                HandleConstantFPOperand(&I, i);
++            }
++          }
++          times--;
++        }
++      }
++    return true;
++  }
++};
++
++ModulePass *createConstantFPEncryptionPass(bool flag) {
++  return new ConstantFPEncryption(flag);
++}
++} // namespace llvm
++char ConstantFPEncryption::ID = 0;
++INITIALIZE_PASS(ConstantFPEncryption, "constfpenc",
++                "Enable ConstantFP Encryption.", false, false)
+diff --git a/llvm/include/llvm/Transforms/Obfuscation/IndirectCall.h b/llvm/include/llvm/Transforms/Obfuscation/IndirectCall.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1fb6692eb4fd5140e181524c872793e29e772873
+--- /dev/null
++++ b/llvm/include/llvm/Transforms/Obfuscation/IndirectCall.h
+@@ -0,0 +1,14 @@
++#ifndef _INDIRECT_CALL_H_
++#define _INDIRECT_CALL_H_
++
++#include "llvm/IR/PassManager.h"
++#include "llvm/Pass.h"
++
++namespace llvm {
++
++FunctionPass *createIndirectCallPass(bool flag);
++void initializeIndirectCallPass(PassRegistry &Registry);
++
++} // namespace llvm
++
++#endif
+diff --git a/llvm/lib/Transforms/Obfuscation/IndirectCall.cpp b/llvm/lib/Transforms/Obfuscation/IndirectCall.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..2fe3040f72c737b54cf2fe795473bde9dd6cfa7b
+--- /dev/null
++++ b/llvm/lib/Transforms/Obfuscation/IndirectCall.cpp
+@@ -0,0 +1,245 @@
++// For open-source license, please refer to
++// [License](https://github.com/HikariObfuscator/Hikari/wiki/License).
++//===----------------------------------------------------------------------===//
++// IndirectCall - replace direct calls to module-defined functions with calls
++// through an (optionally encrypted) function-pointer table, to obscure the
++// static call graph. Modeled after the Hikari-style IndirectBranch /
++// IndirectGlobalVariable passes shipped in this tree.
++//===----------------------------------------------------------------------===//
++#include "llvm/Transforms/Obfuscation/IndirectCall.h"
++#include "llvm/ADT/SmallVector.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/InstIterator.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/NoFolder.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Support/raw_ostream.h"
++#include "llvm/Transforms/Obfuscation/CryptoUtils.h"
++#include "llvm/Transforms/Obfuscation/Utils.h"
++#include "llvm/Transforms/Utils/ModuleUtils.h"
++
++#include <climits>
++#include <cstdint>
++#include <map>
++#include <vector>
++
++using namespace llvm;
++
++static cl::opt<bool>
++    EncryptCallee("icall-enc-addr", cl::init(false), cl::NotHidden,
++                  cl::desc("[IndirectCall]Encrypt callee address in the table"));
++
++static cl::opt<bool>
++    SkipRustLib("icall-skip-rustlib", cl::init(true), cl::NotHidden,
++                cl::desc("[IndirectCall]Skip Rust std/core/alloc and common "
++                         "async ecosystem functions"));
++
++static cl::opt<unsigned> MaxBasicBlocks(
++    "icall-max-bbs", cl::init(0), cl::NotHidden,
++    cl::desc("[IndirectCall]Skip functions with more than N basic blocks "
++             "(0 disables)"));
++
++static bool shouldSkipFunction(const Function &F) {
++  if (MaxBasicBlocks != 0 && F.size() > MaxBasicBlocks)
++    return true;
++  if (!SkipRustLib)
++    return false;
++  StringRef N = F.getName();
++  if (N.starts_with("_ZN4core") || N.starts_with("_ZN3std") ||
++      N.starts_with("_ZN5alloc") || N.starts_with("_ZN5tokio") ||
++      N.starts_with("_ZN5hyper") || N.starts_with("_ZN6rustls") ||
++      N.starts_with("_ZN7futures") || N.starts_with("_ZN5bytes") ||
++      N.starts_with("_ZN5tonic"))
++    return true;
++  if (N.contains("core..") || N.contains("std..") || N.contains("alloc..") ||
++      N.contains("tokio..") || N.contains("hyper..") || N.contains("rustls..") ||
++      N.contains("futures") || N.contains("bytes..") || N.contains("tonic.."))
++    return true;
++  return false;
++}
++
++// Only indirect calls to functions DEFINED in this module. Skipping
++// declarations avoids PLT/GOT/dllimport/ifunc edge cases; the primary value is
++// obscuring the internal call graph.
++static bool isEligibleCallee(Function *G) {
++  if (!G)
++    return false;
++  if (G->isDeclaration())
++    return false;
++  if (G->isIntrinsic())
++    return false;
++  if (G->hasFnAttribute(Attribute::AlwaysInline))
++    return false;
++  StringRef N = G->getName();
++  if (N.starts_with("llvm."))
++    return false;
++  return true;
++}
++
++// A call site is rewritable only if it is a plain call/invoke with a direct,
++// eligible callee (no inline asm, no musttail, no callbr, no operand-bundle
++// weirdness that requires a direct target).
++static Function *getRewritableCallee(Instruction &I) {
++  CallBase *CB = dyn_cast<CallBase>(&I);
++  if (!CB)
++    return nullptr;
++  if (!isa<CallInst>(CB) && !isa<InvokeInst>(CB))
++    return nullptr; // excludes callbr
++  if (CB->isInlineAsm())
++    return nullptr;
++  if (CallInst *CI = dyn_cast<CallInst>(CB))
++    if (CI->isMustTailCall())
++      return nullptr;
++  Function *G = CB->getCalledFunction();
++  if (!isEligibleCallee(G))
++    return nullptr;
++  return G;
++}
++
++namespace llvm {
++struct IndirectCall : public FunctionPass {
++  static char ID;
++  bool flag;
++  bool initialized;
++  bool encrypt;
++  GlobalVariable *FTable;
++  ConstantInt *MEncKey;
++  std::map<Function *, unsigned> fnNumbering;
++
++  IndirectCall() : FunctionPass(ID) {
++    this->flag = true;
++    this->initialized = false;
++    this->encrypt = false;
++    this->FTable = nullptr;
++    this->MEncKey = nullptr;
++  }
++  IndirectCall(bool flag) : FunctionPass(ID) {
++    this->flag = flag;
++    this->initialized = false;
++    this->encrypt = false;
++    this->FTable = nullptr;
++    this->MEncKey = nullptr;
++  }
++  StringRef getPassName() const override { return "IndirectCall"; }
++
++  bool initialize(Module &M) {
++    this->initialized = true;
++    Type *Int8Ty = Type::getInt8Ty(M.getContext());
++    Type *Int32Ty = Type::getInt32Ty(M.getContext());
++    Type *PtrTy = PointerType::getUnqual(M.getContext());
++
++    for (Function &F : M) {
++      if (!toObfuscate(flag, &F, "icall"))
++        continue;
++      if (shouldSkipFunction(F))
++        continue;
++      for (Instruction &I : instructions(F))
++        if (Function *G = getRewritableCallee(I))
++          if (!fnNumbering.count(G)) {
++            unsigned idx = fnNumbering.size();
++            fnNumbering[G] = idx;
++          }
++    }
++    if (fnNumbering.empty())
++      return false;
++
++    this->encrypt = EncryptCallee;
++    if (this->encrypt)
++      MEncKey = cast<ConstantInt>(ConstantInt::get(
++          Int32Ty, cryptoutils->get_range(UINT8_MAX, UINT16_MAX * 2) * 4));
++
++    std::vector<Constant *> Elements(fnNumbering.size());
++    for (auto &Entry : fnNumbering) {
++      Constant *Addr = Entry.first;
++      if (this->encrypt)
++        Addr = ConstantExpr::getGetElementPtr(Int8Ty, Entry.first, MEncKey);
++      Elements[Entry.second] = Addr;
++    }
++    ArrayType *AT = ArrayType::get(PtrTy, Elements.size());
++    Constant *CA = ConstantArray::get(AT, ArrayRef<Constant *>(Elements));
++    FTable = new GlobalVariable(M, AT, false,
++                                GlobalValue::LinkageTypes::PrivateLinkage, CA,
++                                "IndirectCallFunctionTable");
++    appendToCompilerUsed(M, {FTable});
++    return true;
++  }
++
++  Value *buildCalleePtr(Module &M, Instruction *InsertBefore, Function *G,
++                        GlobalVariable *KeyGV, ConstantInt *EncEncKey) {
++    Type *Int8Ty = Type::getInt8Ty(M.getContext());
++    Type *Int32Ty = Type::getInt32Ty(M.getContext());
++    Type *PtrTy = PointerType::getUnqual(M.getContext());
++    Value *zero = ConstantInt::get(Int32Ty, 0);
++
++    IRBuilder<NoFolder> IRB(InsertBefore);
++    Value *GEP =
++        IRB.CreateGEP(FTable->getValueType(), FTable,
++                      {zero, ConstantInt::get(Int32Ty, fnNumbering[G])});
++    Value *Ptr = IRB.CreateLoad(PtrTy, GEP, "icall.target");
++    if (this->encrypt) {
++      Value *KeyRuntime =
++          IRB.CreateXor(IRB.CreateLoad(Int32Ty, KeyGV), EncEncKey);
++      Ptr = IRB.CreateGEP(Int8Ty, Ptr, IRB.CreateSub(zero, KeyRuntime),
++                          "icall.dec");
++    }
++    return Ptr;
++  }
++
++  bool runOnFunction(Function &Func) override {
++    if (!toObfuscate(flag, &Func, "icall"))
++      return false;
++    if (shouldSkipFunction(Func))
++      return false;
++    Module *M = Func.getParent();
++    if (!this->initialized)
++      initialize(*M);
++    if (!FTable || fnNumbering.empty())
++      return false;
++
++    Type *Int32Ty = Type::getInt32Ty(M->getContext());
++
++    // Collect the worklist first; only create the per-function key global when
++    // there is actual work (never publish-then-erase a global; see indgv fix).
++    std::vector<CallBase *> Work;
++    for (Instruction &I : instructions(Func)) {
++      if (Function *G = getRewritableCallee(I)) {
++        (void)G;
++        Work.push_back(cast<CallBase>(&I));
++      }
++    }
++    if (Work.empty())
++      return false;
++
++    GlobalVariable *KeyGV = nullptr;
++    ConstantInt *EncEncKey = nullptr;
++    if (this->encrypt) {
++      EncEncKey = cast<ConstantInt>(
++          ConstantInt::get(Int32Ty, cryptoutils->get_uint32_t()));
++      uint64_t stored = EncEncKey->getZExtValue() ^ MEncKey->getZExtValue();
++      KeyGV = new GlobalVariable(
++          *M, Int32Ty, false, GlobalValue::LinkageTypes::PrivateLinkage,
++          ConstantInt::get(Int32Ty, stored), "IndirectCallAddressEncryptKey");
++      appendToCompilerUsed(*M, {KeyGV});
++    }
++
++    for (CallBase *CB : Work) {
++      Function *G = CB->getCalledFunction();
++      if (!G || !fnNumbering.count(G))
++        continue; // defensive; should not happen
++      Value *Target = buildCalleePtr(*M, CB, G, KeyGV, EncEncKey);
++      // Replace only the callee; signature, calling convention, args, and
++      // operand bundles are preserved.
++      CB->setCalledOperand(Target);
++    }
++    return true;
++  }
++};
++} // namespace llvm
++
++FunctionPass *llvm::createIndirectCallPass(bool flag) {
++  return new IndirectCall(flag);
++}
++char IndirectCall::ID = 0;
++INITIALIZE_PASS(IndirectCall, "icall", "IndirectCall", false, false)
