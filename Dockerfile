@@ -52,15 +52,15 @@ FROM base as builder-llvm
 WORKDIR /repos
 
 # patches
-COPY ollvm21.patch /repos/ollvm21.patch
+COPY ollvm22.patch /repos/ollvm22.patch
 
 # Clone LLVM
-RUN git clone --single-branch --branch rustc/21.1-2025-08-01 --depth 1 https://github.com/rust-lang/llvm-project /repos/llvm-21 && \
-    cd /repos/llvm-21/ && \
-    git apply --reject --ignore-whitespace ../ollvm21.patch && \
+RUN git clone --single-branch --branch rustc/22.1-2026-05-19 --depth 1 https://github.com/rust-lang/llvm-project /repos/llvm-22 && \
+    cd /repos/llvm-22/ && \
+    git apply --reject --ignore-whitespace ../ollvm22.patch && \
     test -z "$(find . -name '*.rej' -o -name '*.orig' -print -quit)"
 
-WORKDIR /repos/llvm-21/
+WORKDIR /repos/llvm-22/
 
 # Build custom LLVM
 # Removed clang;lld from LLVM_ENABLE_PROJECTS to speed up build
@@ -99,16 +99,16 @@ ENV CARGO_HOME=/opt/cargo
 ENV PATH=/opt/cargo/bin:/opt/llvm/bin:$PATH
 
 # Install rustup
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.92.0 --profile minimal
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
 
 COPY --from=builder-llvm /opt/llvm /opt/llvm
 
 # check llvm
 RUN /opt/llvm/bin/llvm-config --version
 
-RUN git clone --single-branch --branch 1.92.0 --depth 1 https://github.com/rust-lang/rust /repos/rust-1.92.0
+RUN git clone --single-branch --branch 1.98.1 --depth 1 https://github.com/rust-lang/rust /repos/rust-1.98.1
 
-WORKDIR /repos/rust-1.92.0/
+WORKDIR /repos/rust-1.98.1/
 
 # Config rust
 RUN set -eux; \
@@ -134,20 +134,18 @@ EOF
 # Build rust
 # Added ccache mount and cargo cache mounts
 RUN --mount=type=cache,target=/cache/ccache \
-    --mount=type=cache,target=/repos/rust-1.92.0/build \
+    --mount=type=cache,target=/repos/rust-1.98.1/build \
     --mount=type=cache,target=/opt/cargo/registry \
     --mount=type=cache,target=/opt/cargo/git \
     python3 x.py build --target x86_64-unknown-linux-gnu,x86_64-pc-windows-gnu
 
 WORKDIR /repos/
 
-RUN rustup toolchain install nightly-2025-10-01 --profile minimal
-
 # Copy artifacts
-RUN --mount=type=cache,target=/repos/rust-1.92.0/build \
+RUN --mount=type=cache,target=/repos/rust-1.98.1/build \
     mkdir -p /opt/rust && \
-    cp -a /repos/rust-1.92.0/build/x86_64-unknown-linux-gnu/stage1/* /opt/rust/ && \
-    cp -f /opt/rustup/toolchains/nightly-2025-10-01-x86_64-unknown-linux-gnu/bin/cargo /opt/rust/bin/cargo
+    cp -a /repos/rust-1.98.1/build/x86_64-unknown-linux-gnu/stage1/* /opt/rust/ && \
+    cp -f /opt/rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo /opt/rust/bin/cargo
 
 FROM ubuntu:24.04 as runtime
 
